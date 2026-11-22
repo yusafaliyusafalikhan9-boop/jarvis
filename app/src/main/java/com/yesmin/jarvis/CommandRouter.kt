@@ -1,16 +1,31 @@
 package com.yesmin.jarvis
 
+import android.Manifest
 import android.app.SearchManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
 import android.net.Uri
+import android.provider.AlarmClock
+import android.provider.ContactsContract
+import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
 /** लोकल कमांड: बिना इंटरनेट और बिना API के चलते हैं। कमांड न मिले तो null लौटाता है। */
 class CommandRouter(private val ctx: Context) {
+
+    companion object {
+        /** MainActivity को बताता है कि कॉन्टैक्ट की अनुमति माँगनी है */
+        const val NEED_CONTACTS = "__NEED_CONTACTS__"
+    }
+
+    private val phoneWords = setOf(
+        "phone", "फोन", "फ़ोन", "number", "नंबर", "नम्बर", "mobile", "मोबाइल",
+        "baat", "बात", "karao", "कराओ", "karwao", "करवाओ", "se", "से"
+    )
 
     private val openTriggers = setOf(
         "open", "kholo", "khol", "launch", "start",
@@ -40,7 +55,9 @@ class CommandRouter(private val ctx: Context) {
     private val ytWords = setOf("youtube", "यूट्यूब", "यूटयूब")
     private val waWords = setOf("whatsapp", "व्हाट्सएप", "व्हाट्सऐप", "वॉट्सऐप", "वाट्सएप", "वॉट्सएप")
     private val msgWords = setOf("message", "msg", "मैसेज", "संदेश")
-    private val callWords = setOf("call", "कॉल", "dial", "लगाओ", "lagao")
+    private val callWords = setOf(
+        "call", "कॉल", "काल", "कोल", "dial", "डायल", "लगाओ", "lagao", "मिलाओ", "milao"
+    )
     private val searchWords = setOf(
         "search", "सर्च", "chalao", "चलाओ", "play", "बजाओ", "bajao",
         "dhundo", "ढूंढो", "खोजो", "khojo"
@@ -48,13 +65,52 @@ class CommandRouter(private val ctx: Context) {
     private val fillers = setOf("par", "पर", "pe", "पे", "me", "में", "mein", "on", "in")
     private val numRegex = Regex("^\\+?\\d{7,15}$")
 
+    // अलार्म और टाइमर के शब्द
+    private val alarmWords = setOf(
+        "alarm", "alaram", "अलार्म", "अलारम",
+        "utha", "uthana", "उठा", "उठाना", "jaga", "jagana", "जगा", "जगाना", "wake"
+    )
+    private val timerWords = setOf("timer", "टाइमर")
+    private val minuteWords = setOf("minute", "minutes", "min", "मिनट", "मिनिट")
+    private val hourWords = setOf("ghante", "ghanta", "घंटे", "घंटा", "hour", "hours")
+    private val bajeWords = setOf("baje", "bje", "बजे", "बजकर")
+    private val amWords = setOf("subah", "सुबह", "savere", "सवेरे", "morning")
+    private val pmWords = setOf(
+        "sham", "शाम", "raat", "रात", "dopahar", "दोपहर", "evening", "night", "afternoon"
+    )
+    private val nightWords = setOf("raat", "रात", "night")
+    private val hindiNums = mapOf(
+        "एक" to 1, "ek" to 1, "दो" to 2, "do" to 2, "तीन" to 3, "teen" to 3,
+        "चार" to 4, "char" to 4, "पांच" to 5, "पाँच" to 5, "paanch" to 5, "panch" to 5,
+        "छह" to 6, "छः" to 6, "chhe" to 6, "che" to 6, "सात" to 7, "saat" to 7,
+        "आठ" to 8, "aath" to 8, "नौ" to 9, "nau" to 9, "दस" to 10, "das" to 10,
+        "ग्यारह" to 11, "gyarah" to 11, "बारह" to 12, "barah" to 12
+    )
+
     fun handle(raw: String): String? {
-        val tokens = raw.lowercase(Locale.ROOT)
-            .replace(Regex("[?!,.।]"), " ")
-            .trim()
-            .split(Regex("\\s+"))
-            .filter { it.isNotEmpty() }
+        val tokens = mergeDigitTokens(
+            normalizeDigits(raw.lowercase(Locale.ROOT))
+                .replace(Regex("[?!,.।]"), " ")
+                .trim()
+                .split(Regex("\\s+"))
+                .filter { it.isNotEmpty() }
+        )
         if (tokens.isEmpty()) return null
+
+        // टाइमर: "10 मिनट का टाइमर", "5 minute baad utha dena"
+        val n = tokens.firstOrNull { it.matches(Regex("^\\d{1,3}$")) }?.toInt()
+        val hasUnit = tokens.any { it in minuteWords || it in hourWords }
+        if (n != null && hasUnit && tokens.any { it in alarmWords || it in timerWords }) {
+            val mins = if (tokens.any { it in hourWords }) n * 60 else n
+            return setTimer(mins)
+        }
+
+        // अलार्म: "सुबह 6 बजे अलार्म लगाओ", "कल 7 बजे उठा देना"
+        if (tokens.size <= 10 && tokens.any { it in alarmWords }) {
+            val t = parseAlarmTime(tokens)
+                ?: return "कितने बजे का अलार्म लगाऊँ? जैसे 'सुबह 6 बजे अलार्म लगाओ'"
+            return setAlarm(t.first, t.second)
+        }
 
         // समय
         if (tokens.size <= 4 && tokens.any { it in setOf("time", "samay", "समय", "टाइम") }) {
@@ -87,7 +143,18 @@ class CommandRouter(private val ctx: Context) {
 
         // कॉल: "call 9876543210"
         if (num != null && tokens.any { it in callWords }) {
-            return startSafely(Intent(Intent.ACTION_DIAL, Uri.parse("tel:$num")), "डायलर खोल रहा हूँ: $num")
+            return dialNumber(num)
+        }
+
+        // कॉल बोला पर नंबर नहीं: कॉन्टैक्ट के नाम से ढूँढो
+        if (num == null && tokens.size <= 5 && tokens.any { it in callWords }) {
+            val nameTokens = tokens.filter {
+                it !in callWords && it !in stopTokens && it !in fillers && it !in phoneWords
+            }
+            if (nameTokens.isEmpty()) {
+                return "किसे कॉल करूँ? नाम या नंबर के साथ बोलो, जैसे 'कॉल करो 9876543210'"
+            }
+            return callByName(nameTokens)
         }
 
         // ऐप खोलना
@@ -107,6 +174,187 @@ class CommandRouter(private val ctx: Context) {
         }
 
         return null
+    }
+
+    /** Gemini (दिमाग) से आया JSON एक्शन चलाता है */
+    fun runAction(a: JSONObject): String =
+        when (a.optString("action")) {
+            "open_app" -> {
+                val nm = a.optString("name").lowercase(Locale.ROOT).trim()
+                if (nm.isEmpty()) "कौन सा ऐप खोलूँ?" else openApp(aliases[nm] ?: nm)
+            }
+            "youtube" -> {
+                val q = a.optString("query").trim()
+                if (q.isEmpty()) {
+                    startSafely(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com")), "YouTube खोल रहा हूँ")
+                } else {
+                    val uri = Uri.parse("https://www.youtube.com/results?search_query=" + Uri.encode(q))
+                    startSafely(Intent(Intent.ACTION_VIEW, uri), "YouTube पर '$q' खोल रहा हूँ")
+                }
+            }
+            "call" -> {
+                val number = a.optString("number").replace(Regex("[^0-9+]"), "")
+                if (number.length >= 7) {
+                    dialNumber(number)
+                } else {
+                    val nm = a.optString("name").lowercase(Locale.ROOT).trim()
+                    if (nm.isEmpty()) "किसे कॉल करूँ?" else callByName(nm.split(Regex("\\s+")))
+                }
+            }
+            "alarm" -> setAlarm(a.optInt("hour", -1), a.optInt("minute", 0))
+            "timer" -> setTimer(a.optInt("minutes", 0))
+            "search" -> {
+                val q = a.optString("query").trim()
+                if (q.isEmpty()) {
+                    "क्या सर्च करूँ?"
+                } else {
+                    startSafely(
+                        Intent(Intent.ACTION_WEB_SEARCH).putExtra(SearchManager.QUERY, q),
+                        "'$q' सर्च कर रहा हूँ"
+                    )
+                }
+            }
+            else -> "यह काम अभी मुझे नहीं आता"
+        }
+
+    private fun dialNumber(number: String): String =
+        startSafely(Intent(Intent.ACTION_DIAL, Uri.parse("tel:$number")), "डायलर खोल रहा हूँ: $number")
+
+    private fun callByName(nameTokens: List<String>): String {
+        if (ctx.checkSelfPermission(Manifest.permission.READ_CONTACTS)
+            != PackageManager.PERMISSION_GRANTED
+        ) return NEED_CONTACTS
+        val hit = findContact(nameTokens)
+            ?: return "कॉन्टैक्ट '${nameTokens.joinToString(" ")}' नहीं मिला। नाम वैसे ही बोलो या लिखो जैसे सेव है"
+        val number = hit.second.replace(Regex("[^0-9+]"), "")
+        return startSafely(
+            Intent(Intent.ACTION_DIAL, Uri.parse("tel:$number")),
+            "${hit.first} को डायल कर रहा हूँ"
+        )
+    }
+
+    private fun setAlarm(hour: Int, minute: Int): String {
+        if (hour !in 0..23 || minute !in 0..59) return "अलार्म का समय सही नहीं लगा। फिर से बोलो"
+        val intent = Intent(AlarmClock.ACTION_SET_ALARM).apply {
+            putExtra(AlarmClock.EXTRA_HOUR, hour)
+            putExtra(AlarmClock.EXTRA_MINUTES, minute)
+            putExtra(AlarmClock.EXTRA_MESSAGE, "Jarvis")
+            putExtra(AlarmClock.EXTRA_SKIP_UI, true)
+        }
+        val h12 = if (hour % 12 == 0) 12 else hour % 12
+        val label = String.format(Locale.US, "%d:%02d %s", h12, minute, if (hour < 12) "AM" else "PM")
+        return startSafely(intent, "अलार्म सेट किया: $label। क्लॉक ऐप में एक बार देख लेना")
+    }
+
+    private fun setTimer(minutes: Int): String {
+        if (minutes !in 1..1440) return "टाइमर 1 मिनट से 24 घंटे के बीच का बोलो"
+        val intent = Intent(AlarmClock.ACTION_SET_TIMER).apply {
+            putExtra(AlarmClock.EXTRA_LENGTH, minutes * 60)
+            putExtra(AlarmClock.EXTRA_MESSAGE, "Jarvis")
+            putExtra(AlarmClock.EXTRA_SKIP_UI, true)
+        }
+        return startSafely(intent, "$minutes मिनट का टाइमर शुरू किया")
+    }
+
+    private fun parseAlarmTime(tokens: List<String>): Pair<Int, Int>? {
+        var hour = -1
+        var minute = 0
+        val colon = Regex("^(\\d{1,2}):(\\d{2})$")
+        for (tok in tokens) {
+            val m = colon.find(tok)
+            if (m != null) {
+                hour = m.groupValues[1].toInt()
+                minute = m.groupValues[2].toInt()
+                break
+            }
+        }
+        if (hour < 0) {
+            for (tok in tokens) {
+                if (tok.matches(Regex("^\\d{3,4}$"))) {
+                    val v = tok.toInt()
+                    hour = v / 100
+                    minute = v % 100
+                    break
+                }
+                if (tok.matches(Regex("^\\d{1,2}$"))) {
+                    hour = tok.toInt()
+                    break
+                }
+            }
+        }
+        if (hour < 0) {
+            for (i in 0 until tokens.size - 1) {
+                val v = hindiNums[tokens[i]]
+                if (v != null && tokens[i + 1] in bajeWords) {
+                    hour = v
+                    break
+                }
+            }
+        }
+        if (hour < 0 || hour > 24 || minute > 59) return null
+
+        val night = tokens.any { it in nightWords }
+        val pm = tokens.any { it in pmWords }
+        val am = tokens.any { it in amWords }
+        if (pm && hour in 1..11 && !(night && hour <= 5)) hour += 12
+        if (night && hour == 12) hour = 0
+        if (am && hour == 12) hour = 0
+        if (hour == 24) hour = 0
+        return hour to minute
+    }
+
+    /** नाम के सभी टुकड़े जिस कॉन्टैक्ट में मिलें, उसका (नाम, नंबर) लौटाता है */
+    private fun findContact(nameTokens: List<String>): Pair<String, String>? {
+        val uri = ContactsContract.CommonDataKinds.Phone.CONTENT_URI
+        val proj = arrayOf(
+            ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+            ContactsContract.CommonDataKinds.Phone.NUMBER
+        )
+        val full = nameTokens.joinToString(" ")
+        var best: Pair<String, String>? = null
+        ctx.contentResolver.query(uri, proj, null, null, null)?.use { c ->
+            val ni = c.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
+            val pi = c.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
+            while (c.moveToNext()) {
+                val dn = c.getString(ni) ?: continue
+                val num = c.getString(pi) ?: continue
+                val low = dn.lowercase(Locale.ROOT)
+                if (low == full) return dn to num
+                if (best == null && nameTokens.all { low.contains(it) }) best = dn to num
+            }
+        }
+        return best
+    }
+
+    /** हिंदी अंकों (९८७...) को 0-9 में बदलता है */
+    private fun normalizeDigits(s: String): String {
+        val sb = StringBuilder()
+        for (ch in s) {
+            val d = Character.digit(ch, 10)
+            if (d >= 0) sb.append('0' + d) else sb.append(ch)
+        }
+        return sb.toString()
+    }
+
+    /** "98765 43210" या "+91 98765-43210" जैसे टुकड़ों को एक नंबर बना देता है */
+    private fun mergeDigitTokens(tokens: List<String>): List<String> {
+        fun isNumPart(t: String) =
+            t.any { it.isDigit() } && t.all { it.isDigit() || it == '+' || it == '-' }
+
+        val out = mutableListOf<String>()
+        for (tok in tokens) {
+            if (isNumPart(tok)) {
+                val clean = tok.replace("-", "")
+                if (out.isNotEmpty() && isNumPart(out.last())) {
+                    out[out.lastIndex] = out.last() + clean
+                } else {
+                    out.add(clean)
+                }
+            } else {
+                out.add(tok)
+            }
+        }
+        return out
     }
 
     private fun openApp(name: String): String {

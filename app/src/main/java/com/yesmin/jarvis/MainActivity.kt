@@ -1,9 +1,11 @@
 package com.yesmin.jarvis
 
+import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.ActivityNotFoundException
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.os.Bundle
 import android.speech.RecognizerIntent
@@ -17,6 +19,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import org.json.JSONObject
 import java.util.Locale
 
 class MainActivity : Activity(), TextToSpeech.OnInitListener {
@@ -28,6 +31,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
     private lateinit var scroll: ScrollView
     private lateinit var input: EditText
     private val history = mutableListOf<Pair<String, String>>()
+    private var pendingText: String? = null
     private val prefs by lazy { getSharedPreferences("jarvis", MODE_PRIVATE) }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
@@ -146,18 +150,75 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         }
     }
 
+    override fun onRequestPermissionsResult(
+        requestCode: Int, permissions: Array<out String>, grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != 200) return
+        val t = pendingText
+        pendingText = null
+        val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+        if (granted && t != null) {
+            reply(execute(t) ?: "यह कमांड समझ नहीं आया")
+        } else {
+            reply("अनुमति के बिना नाम से कॉल नहीं हो सकता। नंबर बोलकर कॉल कर सकते हो।")
+        }
+    }
+
     private fun sendFromInput() {
         val t = input.text.toString().trim()
         input.setText("")
         handleText(t)
     }
 
+    /** सादा कमांड हो तो router.handle, Gemini का JSON एक्शन हो तो router.runAction */
+    private fun execute(text: String): String? =
+        if (text.trimStart().startsWith("{")) {
+            try {
+                router.runAction(JSONObject(text))
+            } catch (e: Exception) {
+                "यह काम समझ नहीं आया"
+            }
+        } else {
+            router.handle(text)
+        }
+
+    /** अनुमति चाहिए तो माँगता है, वरना जवाब दिखाता है */
+    private fun deliver(res: String, executable: String) {
+        if (res == CommandRouter.NEED_CONTACTS) {
+            pendingText = executable
+            reply("नाम से कॉल के लिए कॉन्टैक्ट की अनुमति दो।")
+            requestPermissions(arrayOf(Manifest.permission.READ_CONTACTS), 200)
+        } else {
+            reply(res)
+        }
+    }
+
     private fun handleText(text: String) {
         if (text.isBlank()) return
         append("तुम: $text")
         val local = router.handle(text)
-        if (local != null) { reply(local); return }
+        if (local != null) {
+            deliver(local, text)
+            return
+        }
         askGemini(text)
+    }
+
+    /** Gemini का जवाब JSON एक्शन है या नहीं */
+    private fun asActionJson(ans: String): String? {
+        val t = ans.trim().removePrefix("```json").removePrefix("```").trimStart()
+        if (!t.startsWith("{")) return null
+        val a = t.indexOf('{')
+        val b = t.lastIndexOf('}')
+        if (b <= a) return null
+        val cand = t.substring(a, b + 1)
+        return try {
+            JSONObject(cand)
+            cand
+        } catch (e: Exception) {
+            null
+        }
     }
 
     private fun askGemini(text: String) {
@@ -170,10 +231,15 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         Thread {
             try {
                 val ans = GeminiClient.ask(key, history.takeLast(10), text)
+                val action = asActionJson(ans)
                 runOnUiThread {
-                    history.add("user" to text)
-                    history.add("model" to ans)
-                    reply(ans)
+                    if (action != null) {
+                        deliver(execute(action) ?: "यह काम समझ नहीं आया", action)
+                    } else {
+                        history.add("user" to text)
+                        history.add("model" to ans)
+                        reply(ans)
+                    }
                 }
             } catch (e: Exception) {
                 runOnUiThread { reply("गड़बड़ी: ${e.message}") }
