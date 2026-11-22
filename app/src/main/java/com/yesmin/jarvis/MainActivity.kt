@@ -6,12 +6,11 @@ import android.app.AlertDialog
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.text.InputType
@@ -22,13 +21,15 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.Switch
 import android.widget.TextView
-import org.json.JSONObject
 import java.util.Locale
 
-class MainActivity : Activity(), TextToSpeech.OnInitListener {
+class MainActivity : Activity(),
+    TextToSpeech.OnInitListener, VoiceEngine.Callbacks, Assistant.Ui {
 
-    private lateinit var router: CommandRouter
+    private lateinit var assistant: Assistant
+    private lateinit var voice: VoiceEngine
     private lateinit var tts: TextToSpeech
     private var ttsReady = false
 
@@ -38,28 +39,75 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
     private lateinit var jarvisText: TextView
     private lateinit var scroll: ScrollView
     private lateinit var input: EditText
+    private lateinit var settingsPanel: LinearLayout
+    private lateinit var gapButton: TextView
 
-    private val history = mutableListOf<Pair<String, String>>()
-    private var pendingText: String? = null
     private val handler = Handler(Looper.getMainLooper())
-
-    private var recognizer: SpeechRecognizer? = null
-    private var listening = false
+    private var pendingText: String? = null
     private var busy = false          // Jarvis सोच या बोल रहा है
-    private var autoListen = true     // अपने-आप दोबारा सुनना
+    private var autoListen = true     // बातचीत में अपने-आप दोबारा सुनना
     private var resumed = false
-    private var silentRounds = 0
 
-    private val prefs by lazy { getSharedPreferences("jarvis", MODE_PRIVATE) }
     private val cyan = Color.parseColor("#00E5FF")
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
+    // ---------- जीवन-चक्र ----------
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        router = CommandRouter(this)
+        assistant = Assistant(this, this)
+        voice = VoiceEngine(this, this)
         tts = TextToSpeech(this, this)
+        buildUi()
 
+        val wanted = arrayOf(
+            Manifest.permission.RECORD_AUDIO,
+            Manifest.permission.READ_CONTACTS,
+            Manifest.permission.CALL_PHONE
+        )
+        val missing = wanted.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        if (missing.isNotEmpty()) requestPermissions(missing.toTypedArray(), 300)
+
+        jarvisText.text = "नमस्ते! बस बोलो, जैसे \"Open WhatsApp\", \"यूट्यूब खोलो\", " +
+            "\"सुबह 6 बजे अलार्म लगाओ\" या \"राहुल को कॉल करो\""
+        setStatus("तैयार")
+    }
+
+    override fun onResume() {
+        super.onResume()
+        resumed = true
+        busy = false
+        JarvisService.instance?.pauseListening() // माइक एक ही के पास रहे
+        if (autoListen && hasMic()) voice.start()
+    }
+
+    override fun onPause() {
+        resumed = false
+        handler.removeCallbacksAndMessages(null)
+        voice.stop()
+        if (ttsReady) tts.stop()
+        hud.state = HudView.State.IDLE
+        JarvisService.instance?.resumeListening()
+        super.onPause()
+    }
+
+    override fun onDestroy() {
+        voice.destroy()
+        tts.shutdown()
+        super.onDestroy()
+    }
+
+    private fun hasMic() =
+        checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+    private fun setStatus(s: String) {
+        statusText.text = s
+    }
+
+    // ---------- स्क्रीन ----------
+
+    private fun buildUi() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(14), dp(14), dp(14), dp(10))
@@ -79,13 +127,13 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
             },
             LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         )
-        top.addView(TextView(this).apply {
-            text = "API KEY"
-            textSize = 13f
-            setTextColor(cyan)
-            setPadding(dp(10), dp(8), dp(10), dp(8))
-            setOnClickListener { showKeyDialog() }
+        top.addView(smallButton("⚙") {
+            settingsPanel.visibility =
+                if (settingsPanel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
         })
+        top.addView(smallButton("API KEY") { showKeyDialog() })
+
+        settingsPanel = buildSettingsPanel()
 
         hud = HudView(this)
         hud.setOnClickListener { toggleListening() }
@@ -138,23 +186,218 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         })
 
         root.addView(top)
+        root.addView(settingsPanel)
         root.addView(hud, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.3f))
         root.addView(statusText)
         root.addView(scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 0.8f))
         root.addView(bottom)
         setContentView(root)
-
-        val wanted = arrayOf(
-            Manifest.permission.RECORD_AUDIO,
-            Manifest.permission.READ_CONTACTS,
-            Manifest.permission.CALL_PHONE
-        )
-        val missing = wanted.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
-        if (missing.isNotEmpty()) requestPermissions(missing.toTypedArray(), 300)
-
-        jarvisText.text = "नमस्ते! बस बोलो, जैसे \"व्हाट्सएप खोलो\", \"सुबह 6 बजे अलार्म लगाओ\" या \"कॉल करो…\""
-        setStatus("तैयार")
     }
+
+    private fun smallButton(label: String, onClick: () -> Unit): TextView =
+        TextView(this).apply {
+            text = label
+            textSize = 13f
+            setTextColor(cyan)
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            setOnClickListener { onClick() }
+        }
+
+    private fun styledSwitch(label: String, on: Boolean, onChange: (Boolean) -> Unit): Switch =
+        Switch(this).apply {
+            text = label
+            setTextColor(Color.WHITE)
+            isChecked = on
+            setPadding(0, dp(6), 0, dp(6))
+            setOnCheckedChangeListener { _, checked -> onChange(checked) }
+        }
+
+    private fun buildSettingsPanel(): LinearLayout {
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            setPadding(dp(4), dp(4), dp(4), dp(8))
+        }
+
+        lateinit var bgSwitch: Switch
+        bgSwitch = styledSwitch(
+            "बैकग्राउंड में \"Hey Jarvis\" सुनो",
+            Prefs.bgListen(this) && JarvisService.running
+        ) { on ->
+            if (on) {
+                if (!hasMic()) {
+                    requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 301)
+                    bgSwitch.isChecked = false
+                } else {
+                    if (Build.VERSION.SDK_INT >= 33 &&
+                        checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+                        PackageManager.PERMISSION_GRANTED
+                    ) {
+                        requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 302)
+                    }
+                    Prefs.setBgListen(this, true)
+                    try {
+                        JarvisService.start(this)
+                        setStatus("बैकग्राउंड सुनना चालू। ऐप से बाहर जाकर \"Hey Jarvis\" बोलो")
+                    } catch (e: Exception) {
+                        Prefs.setBgListen(this, false)
+                        bgSwitch.isChecked = false
+                        setStatus("सर्विस शुरू नहीं हो पाई: ${e.message}")
+                    }
+                }
+            } else {
+                Prefs.setBgListen(this, false)
+                JarvisService.stop(this)
+            }
+        }
+        panel.addView(bgSwitch)
+
+        panel.addView(styledSwitch("स्क्रीन ऑन होने पर ग्रीटिंग", Prefs.greeting(this)) {
+            Prefs.setGreeting(this, it)
+        })
+        panel.addView(styledSwitch("तैरता HUD दिखाओ", Prefs.floatingHud(this)) {
+            Prefs.setFloatingHud(this, it)
+        })
+
+        gapButton = smallButton("") {
+            val options = listOf(5, 10, 30, 60)
+            val cur = options.indexOf(Prefs.greetGapMin(this))
+            Prefs.setGreetGapMin(this, options[(cur + 1) % options.size])
+            refreshGapLabel()
+        }
+        panel.addView(gapButton)
+        refreshGapLabel()
+
+        panel.addView(smallButton("दूसरे ऐप के ऊपर दिखाने की अनुमति (HUD/बैकग्राउंड के लिए)") {
+            startActivity(
+                Intent(
+                    android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:$packageName")
+                )
+            )
+        })
+        panel.addView(smallButton("बैटरी सेटिंग खोलो (Jarvis को रोके नहीं)") {
+            startActivity(Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+        })
+        return panel
+    }
+
+    private fun refreshGapLabel() {
+        gapButton.text = "ग्रीटिंग अंतराल: ${Prefs.greetGapMin(this)} मिनट (बदलने को दबाओ)"
+    }
+
+    private fun showKeyDialog() {
+        val et = EditText(this).apply {
+            hint = "Gemini API key"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            setText(Prefs.apiKey(this@MainActivity))
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Gemini API Key")
+            .setView(et)
+            .setPositiveButton("Save") { _, _ ->
+                Prefs.setApiKey(this, et.text.toString().trim())
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    // ---------- सुनना (VoiceEngine.Callbacks) ----------
+
+    override fun onListening() {
+        hud.state = HudView.State.LISTENING
+        val lang = if (voice.currentLanguage().startsWith("hi")) "हिंदी" else "English"
+        setStatus("सुन रहा हूँ… ($lang)")
+    }
+
+    override fun onLevel(level: Float) {
+        hud.level = level
+    }
+
+    override fun onPartial(text: String) {
+        youText.text = "तुम: $text…"
+    }
+
+    override fun onFinalResults(candidates: List<String>) {
+        voice.stop()
+        val text = WakeWord.strip(candidates.first()) // "Jarvis" कहा हो तो हटा दो
+        if (text.isBlank()) {
+            if (autoListen) voice.restart(300)
+            return
+        }
+        startCommand(text)
+    }
+
+    override fun onGaveUp(reason: String, fatal: Boolean) {
+        hud.state = HudView.State.IDLE
+        autoListen = false
+        setStatus(reason)
+        if (fatal && !hasMic()) requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 301)
+    }
+
+    private fun toggleListening() {
+        if (autoListen) {
+            autoListen = false
+            voice.stop()
+            hud.state = HudView.State.IDLE
+            setStatus("रुक गया। गोले को दबाओ")
+        } else {
+            autoListen = true
+            if (!busy) voice.start()
+        }
+    }
+
+    // ---------- करना (Assistant.Ui) ----------
+
+    private fun sendFromInput() {
+        val t = input.text.toString().trim()
+        input.setText("")
+        if (t.isNotEmpty()) {
+            voice.stop()
+            startCommand(t)
+        }
+    }
+
+    private fun startCommand(text: String) {
+        busy = true
+        youText.text = "तुम: $text"
+        jarvisText.text = ""
+        assistant.process(text)
+    }
+
+    override fun onThinking() {
+        hud.state = HudView.State.THINKING
+        setStatus("सोच रहा हूँ…")
+    }
+
+    override fun onNeedContacts(pending: String) {
+        pendingText = pending
+        onReply("नाम से कॉल के लिए कॉन्टैक्ट की अनुमति दो।")
+        requestPermissions(arrayOf(Manifest.permission.READ_CONTACTS), 200)
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int, permissions: Array<out String>, grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+        when (requestCode) {
+            200 -> {
+                val t = pendingText
+                pendingText = null
+                if (granted && t != null) {
+                    assistant.resume(t)
+                } else {
+                    onReply("अनुमति के बिना नाम से कॉल नहीं हो सकता। नंबर बोलकर कॉल कर सकते हो।")
+                }
+            }
+            300, 301 -> {
+                if (hasMic() && resumed && autoListen && !busy) voice.start()
+            }
+        }
+    }
+
+    // ---------- बोलना ----------
 
     override fun onInit(status: Int) {
         ttsReady = status == TextToSpeech.SUCCESS
@@ -173,272 +416,13 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         }
     }
 
-    override fun onResume() {
-        super.onResume()
-        resumed = true
-        busy = false
-        if (autoListen && hasMic()) handler.postDelayed({ startListening() }, 400)
-    }
-
-    override fun onPause() {
-        resumed = false
-        handler.removeCallbacksAndMessages(null)
-        recognizer?.cancel()
-        listening = false
-        if (ttsReady) tts.stop()
-        hud.state = HudView.State.IDLE
-        super.onPause()
-    }
-
-    override fun onDestroy() {
-        recognizer?.destroy()
-        tts.shutdown()
-        super.onDestroy()
-    }
-
-    private fun hasMic() = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-
-    private fun setStatus(s: String) { statusText.text = s }
-
-    // ---------- सुनना ----------
-
-    private val listener = object : RecognitionListener {
-        override fun onReadyForSpeech(params: Bundle?) {}
-        override fun onBeginningOfSpeech() {}
-        override fun onRmsChanged(rmsdB: Float) {
-            hud.level = ((rmsdB + 2f) / 10f).coerceIn(0f, 1f)
-        }
-        override fun onBufferReceived(buffer: ByteArray?) {}
-        override fun onEndOfSpeech() {}
-        override fun onEvent(eventType: Int, params: Bundle?) {}
-
-        override fun onPartialResults(partialResults: Bundle?) {
-            val p = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
-            if (!p.isNullOrBlank()) youText.text = "तुम: $p…"
-        }
-
-        override fun onResults(results: Bundle?) {
-            listening = false
-            val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
-            if (text.isNullOrBlank()) {
-                scheduleRelisten()
-                return
-            }
-            silentRounds = 0
-            handleText(text)
-        }
-
-        override fun onError(error: Int) {
-            listening = false
-            hud.level = 0f
-            when (error) {
-                SpeechRecognizer.ERROR_NO_MATCH,
-                SpeechRecognizer.ERROR_SPEECH_TIMEOUT,
-                SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> scheduleRelisten()
-                SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
-                    autoListen = false
-                    hud.state = HudView.State.IDLE
-                    setStatus("माइक की अनुमति चाहिए")
-                    requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 301)
-                }
-                else -> {
-                    autoListen = false
-                    hud.state = HudView.State.IDLE
-                    setStatus("आवाज़ पहचान नहीं चली (इंटरनेट देखो)। 🎤 दबाओ")
-                }
-            }
-        }
-    }
-
-    private fun startListening() {
-        if (listening || busy || !resumed) return
-        if (!hasMic()) {
-            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 301)
-            return
-        }
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            setStatus("इस फ़ोन में आवाज़ पहचान नहीं मिली। नीचे लिखकर बोलो")
-            autoListen = false
-            return
-        }
-        if (recognizer == null) {
-            recognizer = SpeechRecognizer.createSpeechRecognizer(this)
-            recognizer?.setRecognitionListener(listener)
-        }
-        val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "hi-IN")
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
-        }
-        listening = true
-        hud.state = HudView.State.LISTENING
-        setStatus("सुन रहा हूँ…")
-        recognizer?.startListening(i)
-    }
-
-    /** कुछ सुनाई न दे तो थोड़ी देर बाद फिर सुनो, पर बैटरी बचाने को 6 बार के बाद रुक जाओ */
-    private fun scheduleRelisten() {
-        silentRounds++
-        if (silentRounds > 6) {
-            autoListen = false
-            hud.state = HudView.State.IDLE
-            setStatus("आराम कर रहा हूँ। जगाने के लिए बीच के गोले को दबाओ")
-            return
-        }
-        handler.postDelayed({
-            if (autoListen && resumed && !listening && !busy) startListening()
-        }, 500)
-    }
-
-    private fun toggleListening() {
-        if (listening || (autoListen && !busy)) {
-            autoListen = false
-            recognizer?.cancel()
-            listening = false
-            hud.state = HudView.State.IDLE
-            setStatus("रुक गया। गोले को दबाओ")
-        } else {
-            autoListen = true
-            silentRounds = 0
-            startListening()
-        }
-    }
-
-    // ---------- समझना और करना ----------
-
-    private fun showKeyDialog() {
-        val et = EditText(this).apply {
-            hint = "Gemini API key"
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-            setText(prefs.getString("key", ""))
-        }
-        AlertDialog.Builder(this)
-            .setTitle("Gemini API Key")
-            .setView(et)
-            .setPositiveButton("Save") { _, _ ->
-                prefs.edit().putString("key", et.text.toString().trim()).apply()
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
-    }
-
-    override fun onRequestPermissionsResult(
-        requestCode: Int, permissions: Array<out String>, grantResults: IntArray
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 200) {
-            val t = pendingText
-            pendingText = null
-            val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
-            if (granted && t != null) {
-                reply(execute(t) ?: "यह कमांड समझ नहीं आया")
-            } else {
-                reply("अनुमति के बिना नाम से कॉल नहीं हो सकता। नंबर बोलकर कॉल कर सकते हो।")
-            }
-        } else if (requestCode == 300 || requestCode == 301) {
-            if (hasMic() && resumed) {
-                autoListen = true
-                handler.postDelayed({ startListening() }, 300)
-            }
-        }
-    }
-
-    private fun sendFromInput() {
-        val t = input.text.toString().trim()
-        input.setText("")
-        handleText(t)
-    }
-
-    /** सादा कमांड हो तो router.handle, Gemini का JSON एक्शन हो तो router.runAction */
-    private fun execute(text: String): String? =
-        if (text.trimStart().startsWith("{")) {
-            try {
-                router.runAction(JSONObject(text))
-            } catch (e: Exception) {
-                "यह काम समझ नहीं आया"
-            }
-        } else {
-            router.handle(text)
-        }
-
-    /** अनुमति चाहिए तो माँगता है, वरना जवाब दिखाता है */
-    private fun deliver(res: String, executable: String) {
-        if (res == CommandRouter.NEED_CONTACTS) {
-            pendingText = executable
-            reply("नाम से कॉल के लिए कॉन्टैक्ट की अनुमति दो।")
-            requestPermissions(arrayOf(Manifest.permission.READ_CONTACTS), 200)
-        } else {
-            reply(res)
-        }
-    }
-
-    private fun handleText(text: String) {
-        if (text.isBlank()) return
-        recognizer?.cancel()
-        listening = false
-        busy = true
-        youText.text = "तुम: $text"
-        jarvisText.text = ""
-        val local = router.handle(text)
-        if (local != null) {
-            deliver(local, text)
-            return
-        }
-        askGemini(text)
-    }
-
-    /** Gemini का जवाब JSON एक्शन है या नहीं */
-    private fun asActionJson(ans: String): String? {
-        val t = ans.trim().removePrefix("```json").removePrefix("```").trimStart()
-        if (!t.startsWith("{")) return null
-        val a = t.indexOf('{')
-        val b = t.lastIndexOf('}')
-        if (b <= a) return null
-        val cand = t.substring(a, b + 1)
-        return try {
-            JSONObject(cand)
-            cand
-        } catch (e: Exception) {
-            null
-        }
-    }
-
-    private fun askGemini(text: String) {
-        val key = prefs.getString("key", "").orEmpty()
-        if (key.isEmpty()) {
-            reply("पहले ऊपर 'API KEY' दबाकर Gemini की free key डालो।")
-            return
-        }
-        hud.state = HudView.State.THINKING
-        setStatus("सोच रहा हूँ…")
-        Thread {
-            try {
-                val ans = GeminiClient.ask(key, history.takeLast(10), text)
-                val action = asActionJson(ans)
-                runOnUiThread {
-                    if (action != null) {
-                        deliver(execute(action) ?: "यह काम समझ नहीं आया", action)
-                    } else {
-                        history.add("user" to text)
-                        history.add("model" to ans)
-                        reply(ans)
-                    }
-                }
-            } catch (e: Exception) {
-                runOnUiThread { reply("गड़बड़ी: ${e.message}") }
-            }
-        }.start()
-    }
-
-    // ---------- बोलना ----------
-
-    private fun reply(msg: String) {
+    override fun onReply(msg: String) {
         busy = true
         jarvisText.text = msg
         scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
         hud.state = HudView.State.SPEAKING
         setStatus("बोल रहा हूँ")
+        voice.stop()
         if (ttsReady) {
             tts.speak(msg, TextToSpeech.QUEUE_FLUSH, null, "reply")
         } else {
@@ -450,6 +434,6 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         busy = false
         hud.state = HudView.State.IDLE
         setStatus("तैयार")
-        if (autoListen && resumed) handler.postDelayed({ startListening() }, 300)
+        if (autoListen && resumed) voice.restart(300)
     }
 }

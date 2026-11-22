@@ -15,7 +15,19 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.7"
+      - name: Prepare signing key (optional, from GitHub Secrets)
+        env:
+          KS_B64: ${{ secrets.JARVIS_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/jarvis.keystore"
+            echo "JARVIS_KEYSTORE_FILE=$RUNNER_TEMP/jarvis.keystore" >> "$GITHUB_ENV"
+          fi
       - run: gradle assembleDebug --no-daemon
+        env:
+          JARVIS_KEYSTORE_PASS: ${{ secrets.JARVIS_KEYSTORE_PASS }}
+          JARVIS_KEY_ALIAS: ${{ secrets.JARVIS_KEY_ALIAS }}
+          JARVIS_KEY_PASS: ${{ secrets.JARVIS_KEY_PASS }}
       - uses: actions/upload-artifact@v4
         with:
           name: jarvis-apk

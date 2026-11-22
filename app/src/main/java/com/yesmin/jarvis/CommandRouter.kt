@@ -20,6 +20,9 @@ class CommandRouter(private val ctx: Context) {
     companion object {
         /** MainActivity को बताता है कि कॉन्टैक्ट की अनुमति माँगनी है */
         const val NEED_CONTACTS = "__NEED_CONTACTS__"
+
+        /** "__CONFIRM_CALL__:नाम\tनंबर" : कॉल से पहले हाँ/नहीं पूछना है */
+        const val CONFIRM_PREFIX = "__CONFIRM_CALL__:"
     }
 
     private val phoneWords = setOf(
@@ -34,9 +37,9 @@ class CommandRouter(private val ctx: Context) {
 
     private val stopTokens = setOf(
         "open", "kholo", "khol", "launch", "start", "do", "kar", "karo", "kardo",
-        "please", "plz", "app", "the", "my", "ko", "mera", "meri", "zara",
+        "please", "plz", "app", "the", "my", "ko", "mera", "meri", "mere", "zara",
         "खोलो", "खोल", "खोलें", "ओपन", "चालू", "दो", "करो", "कर", "कीजिए",
-        "ऐप", "एप", "एप्प", "को", "मेरा", "मेरी", "प्लीज", "जरा"
+        "ऐप", "एप", "एप्प", "को", "मेरा", "मेरी", "मेरे", "प्लीज", "जरा"
     )
 
     private val aliases = mapOf(
@@ -143,7 +146,7 @@ class CommandRouter(private val ctx: Context) {
 
         // कॉल: "call 9876543210"
         if (num != null && tokens.any { it in callWords }) {
-            return dialNumber(num)
+            return callNumber(num, num)
         }
 
         // कॉल बोला पर नंबर नहीं: कॉन्टैक्ट के नाम से ढूँढो
@@ -195,7 +198,7 @@ class CommandRouter(private val ctx: Context) {
             "call" -> {
                 val number = a.optString("number").replace(Regex("[^0-9+]"), "")
                 if (number.length >= 7) {
-                    dialNumber(number)
+                    CONFIRM_PREFIX + number + "\t" + number
                 } else {
                     val nm = a.optString("name").lowercase(Locale.ROOT).trim()
                     if (nm.isEmpty()) "किसे कॉल करूँ?" else callByName(nm.split(Regex("\\s+")))
@@ -218,7 +221,7 @@ class CommandRouter(private val ctx: Context) {
         }
 
     /** अनुमति हो तो सीधे कॉल लगाता है, वरना डायलर में नंबर भरकर खोलता है */
-    private fun dialNumber(number: String, who: String = number): String {
+    fun callNumber(number: String, who: String = number): String {
         if (ctx.checkSelfPermission(Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED) {
             try {
                 val call = Intent(Intent.ACTION_CALL, Uri.parse("tel:$number"))
@@ -235,14 +238,29 @@ class CommandRouter(private val ctx: Context) {
         )
     }
 
+    private fun cleanNumber(n: String) = n.replace(Regex("[^0-9+]"), "")
+
+    /**
+     * नाम से कॉल: पूरा नाम ठीक एक कॉन्टैक्ट से मिले तभी सीधे कॉल।
+     * आधा-अधूरा मिलान हो तो पुष्टि माँगता है, कई मिलें तो नाम गिनाकर पूरा नाम पूछता है।
+     */
     private fun callByName(nameTokens: List<String>): String {
         if (ctx.checkSelfPermission(Manifest.permission.READ_CONTACTS)
             != PackageManager.PERMISSION_GRANTED
         ) return NEED_CONTACTS
-        val hit = findContact(nameTokens)
-            ?: return "कॉन्टैक्ट '${nameTokens.joinToString(" ")}' नहीं मिला। नाम वैसे ही बोलो या लिखो जैसे सेव है"
-        val number = hit.second.replace(Regex("[^0-9+]"), "")
-        return dialNumber(number, hit.first)
+
+        val spoken = nameTokens.joinToString(" ")
+        val matches = findContacts(nameTokens)
+        if (matches.isEmpty()) {
+            return "कॉन्टैक्ट '$spoken' नहीं मिला। नाम वैसे ही बोलो या लिखो जैसे सेव है"
+        }
+        val exact = matches.filter { it.first.lowercase(Locale.ROOT) == spoken }
+        if (exact.size == 1) return callNumber(cleanNumber(exact[0].second), exact[0].first)
+        if (matches.size == 1) {
+            return CONFIRM_PREFIX + matches[0].first + "\t" + cleanNumber(matches[0].second)
+        }
+        val names = matches.take(4).joinToString(", ") { it.first }
+        return "कई कॉन्टैक्ट मिले: $names। पूरा नाम बताओ"
     }
 
     private fun setAlarm(hour: Int, minute: Int): String {
@@ -315,15 +333,15 @@ class CommandRouter(private val ctx: Context) {
         return hour to minute
     }
 
-    /** नाम के सभी टुकड़े जिस कॉन्टैक्ट में मिलें, उसका (नाम, नंबर) लौटाता है */
-    private fun findContact(nameTokens: List<String>): Pair<String, String>? {
+    /** नाम के सभी टुकड़े जिनमें मिलें, उन कॉन्टैक्ट्स की (नाम, नंबर) सूची; पूरा मिलान सबसे ऊपर */
+    private fun findContacts(nameTokens: List<String>): List<Pair<String, String>> {
         val uri = ContactsContract.CommonDataKinds.Phone.CONTENT_URI
         val proj = arrayOf(
             ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
             ContactsContract.CommonDataKinds.Phone.NUMBER
         )
         val full = nameTokens.joinToString(" ")
-        var best: Pair<String, String>? = null
+        val found = LinkedHashMap<String, String>()
         ctx.contentResolver.query(uri, proj, null, null, null)?.use { c ->
             val ni = c.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
             val pi = c.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
@@ -331,11 +349,12 @@ class CommandRouter(private val ctx: Context) {
                 val dn = c.getString(ni) ?: continue
                 val num = c.getString(pi) ?: continue
                 val low = dn.lowercase(Locale.ROOT)
-                if (low == full) return dn to num
-                if (best == null && nameTokens.all { low.contains(it) }) best = dn to num
+                if (nameTokens.all { low.contains(it) } && !found.containsKey(dn)) found[dn] = num
             }
         }
-        return best
+        return found.entries
+            .map { it.key to it.value }
+            .sortedBy { if (it.first.lowercase(Locale.ROOT) == full) 0 else 1 }
     }
 
     /** हिंदी अंकों (९८७...) को 0-9 में बदलता है */
