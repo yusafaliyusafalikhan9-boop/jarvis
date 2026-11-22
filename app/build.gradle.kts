@@ -15,6 +15,15 @@ android {
         versionName = "1.0"
     }
 
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file("jarvis-debug.keystore")
+            storePassword = "jarvis123"
+            keyAlias = "jarvis"
+            keyPassword = "jarvis123"
+        }
+    }
+
     buildTypes {
         release { isMinifyEnabled = false }
     }

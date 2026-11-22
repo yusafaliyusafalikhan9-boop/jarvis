@@ -217,8 +217,23 @@ class CommandRouter(private val ctx: Context) {
             else -> "यह काम अभी मुझे नहीं आता"
         }
 
-    private fun dialNumber(number: String): String =
-        startSafely(Intent(Intent.ACTION_DIAL, Uri.parse("tel:$number")), "डायलर खोल रहा हूँ: $number")
+    /** अनुमति हो तो सीधे कॉल लगाता है, वरना डायलर में नंबर भरकर खोलता है */
+    private fun dialNumber(number: String, who: String = number): String {
+        if (ctx.checkSelfPermission(Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED) {
+            try {
+                val call = Intent(Intent.ACTION_CALL, Uri.parse("tel:$number"))
+                call.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                ctx.startActivity(call)
+                return "$who को कॉल लगा रहा हूँ"
+            } catch (e: Exception) {
+                // सीधा कॉल न हो सका, डायलर पर लौट जाओ
+            }
+        }
+        return startSafely(
+            Intent(Intent.ACTION_DIAL, Uri.parse("tel:$number")),
+            "डायलर खोल रहा हूँ: $who। हरा बटन दबाओ"
+        )
+    }
 
     private fun callByName(nameTokens: List<String>): String {
         if (ctx.checkSelfPermission(Manifest.permission.READ_CONTACTS)
@@ -227,10 +242,7 @@ class CommandRouter(private val ctx: Context) {
         val hit = findContact(nameTokens)
             ?: return "कॉन्टैक्ट '${nameTokens.joinToString(" ")}' नहीं मिला। नाम वैसे ही बोलो या लिखो जैसे सेव है"
         val number = hit.second.replace(Regex("[^0-9+]"), "")
-        return startSafely(
-            Intent(Intent.ACTION_DIAL, Uri.parse("tel:$number")),
-            "${hit.first} को डायल कर रहा हूँ"
-        )
+        return dialNumber(number, hit.first)
     }
 
     private fun setAlarm(hour: Int, minute: Int): String {
